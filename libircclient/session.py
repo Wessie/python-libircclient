@@ -2,12 +2,13 @@ from __future__ import absolute_import
 from functools import partial
 from .lib.irc import ffi, lib
 from .lib import convert_char_array, convert_strings
+import threading
 
 
 __all__ = ["Session"]
 
 
-def event_callback(_self, session, event, origin, params, count):
+def event_callback(self, session, event, origin, params, count):
     """
     Generic event handler, used for most events.
     """
@@ -15,42 +16,46 @@ def event_callback(_self, session, event, origin, params, count):
     params = convert_char_array(params, count)
 
     print session, event, origin, params, count
-event_callback.signature = "void(irc_session_t*, const char*, const char*, const char**, unsigned int)"
+event_callback.signature = ("void(irc_session_t*, const char*,"
+                            "const char*, const char**, unsigned int)")
 
 
-def event_dcc_chat(_self, session, nick, address, dccid):
+def event_dcc_chat(self, session, nick, address, dccid):
     """
     Event handler for DCC CHAT requests.
     """
     nick, address = convert_strings(nick, address)
 
     print session, nick, address, dccid
-event_dcc_chat.signature = "void(irc_session_t*, const char*, const char*, irc_dcc_t)"
+event_dcc_chat.signature = ("void(irc_session_t*, const char*,"
+                            "const char*, irc_dcc_t)")
 
 
-def event_dcc_send(_self, session, nick, address, filename, size, dccid):
+def event_dcc_send(self, session, nick, address, filename, size, dccid):
     """
     Event handler for DCC SEND requests.
     """
     nick, address, filename = convert_strings(nick, address, filename)
 
     print session, nick, address, filename, size, dccid
-event_dcc_send.signature = "void(irc_session_t*, const char*, const char*, const char*, unsigned long, irc_dcc_t)"
+event_dcc_send.signature = ("void(irc_session_t*, const char*, const char*,"
+                            "const char*, unsigned long, irc_dcc_t)")
 
 
-def eventcode_callback(_self, session, event, origin, params, count):
+def eventcode_callback(self, session, event, origin, params, count):
     """
     Event handler for numeric events.
     """
     # Convert ourself to python objects as early as possible.
-    origin = convert_strings(origin)
+    origin, = convert_strings(origin)
     params = convert_char_array(params, count)
 
     print session, event, origin, params, count
-eventcode_callback.signature = "void(irc_session_t*, unsigned int, const char*, const char**, unsigned int)"
+eventcode_callback.signature = ("void(irc_session_t*, unsigned int,"
+                                "const char*, const char**, unsigned int)")
 
 
-# A list of callback events we know off, this to simplify our struct populating.
+# A list of callback events we know off, this to simplify our struct creation
 _callback_members = {
     event_callback: [
         'event_connect',
@@ -71,18 +76,17 @@ _callback_members = {
         'event_ctcp_rep',
         'event_ctcp_action',
         'event_unknown',
-        ],
+    ],
     eventcode_callback: [
         'event_numeric',
-        ],
+    ],
     event_dcc_chat: [
         'event_dcc_chat_req',
-        ],
+    ],
     event_dcc_send: [
         'event_dcc_send_req',
-        ],
+    ],
 }
-
 
 
 class Session(object):
@@ -103,6 +107,7 @@ class Session(object):
         Sets the result as `self._callbacks`.
         """
         callbacks = ffi.new("irc_callbacks_t *")
+        callback_store = []
 
         for func, events in _callback_members.iteritems():
             # We want our callbacks to know which session they belong to,
@@ -112,15 +117,17 @@ class Session(object):
             # Save the signature since partial will not copy them.
             signature = func.signature
             # Wrap the function so we pass it our current session
-            func = partial(func, _self=self)
+            func = partial(func, self)
             # And get our cdata function type!
             func = ffi.callback(signature, func)
 
             for event in events:
                 setattr(callbacks, event, func)
+                # Keep a reference around so it won't be deallocated
+                callback_store.append(func)
 
         self._callbacks = callbacks
-
+        self._callback_store = callback_store
 
     def add_handler(self, event, callback):
         pass
@@ -128,97 +135,114 @@ class Session(object):
     def remove_handler(self, callback):
         pass
 
-    def connect(self, server, port, passwd, nick, username, realname):
-        pass
+    def connect(self, server, port, passwd, nick,
+                username=ffi.NULL, realname=ffi.NULL):
+        lib.irc_connect(
+            self._session,
+            server,
+            port,
+            passwd,
+            nick,
+            username,
+            realname
+        )
 
     def disconnect(self):
-        ffi.irc_disconnect(self._session)
+        lib.irc_disconnect(self._session)
 
     def connected(self):
-        return bool(ffi.irc_is_connected(self._session))
+        return bool(lib.irc_is_connected(self._session))
 
-    def run(self):
+    def run(self, threaded=True):
         """
         Runs the client event loop until disconnect or call to quit.
         """
-        ffi.irc_run(self._session)
+        if threaded:
+            thread = threading.Thread(target=self.run,
+                                      kwargs={"threaded": False})
+            thread.daemon = True
+            thread.start()
+        else:
+            lib.irc_run(self._session)
 
-    def join(self, channel, key=None):
+    def join(self, channel, key=ffi.NULL):
         """
         Joins a channel on the server.
         """
-        pass
+        lib.irc_cmd_join(self._session, channel, key)
 
     def part(self, channel):
         """
         Parts a channel, part message is not supported.
         """
-        pass
+        lib.irc_cmd_part(self._session, channel)
 
     def invite(self, nick, channel):
         """
         Invites someone to a channel.
         """
-        pass
+        lib.irc_cmd_invite(self._session, nick, channel)
 
-    def names(self, channel):
+    def names(self, *channels):
         """
         Ask for the list of users in the channel.
         """
-        pass
+        lib.irc_cmd_names(self._session, ",".join(channels))
 
-    def list(self, channels*):
+    def list(self, *channels):
         """
-        Ask for a list of channels on the active server, if a channel is given it will instead
-        return a list of users. This supports multiple channels.
+        Ask for a list of channels on the active server, if a channel is
+        given it will instead return a list of users. This supports multiple
+        channels.
         """
-        pass
+        lib.irc_cmd_list(self._session, ",".join(channels))
 
-    def topic(self, channel, topic=None):
+    def topic(self, channel, topic=ffi.NULL):
         """
-        Sets the topic if topic is not None, otherwise returns the current topic.
+        Sets the topic if topic is not None, otherwise returns
+        the current topic.
         """
-        pass
+        lib.irc_cmd_topic(self._session, channel, topic)
 
-    def channel_mode(self, channel, mode=None):
+    def channel_mode(self, channel, mode=ffi.NULL):
         """
         Set channel mode.
         """
-        pass
+        lib.irc_cmd_channel_mode(self._session, channel, mode)
 
-    def kick(self, nick, channel, reason):
+    def kick(self, nick, channel, reason=ffi.NULL):
         """
         Kicks someone from a channel.
         """
-        pass
+        lib.irc_cmd_kick(self._session, nick, channel, reason)
 
     def msg(self, nch, text):
-        pass
+        lib.irc_cmd_msg(self._session, nch, text)
 
     def me(self, nch, text):
-        pass
+        lib.irc_cmd_me(self._session, nch, text)
 
     def notice(self, nch, text):
-        pass
+        lib.irc_cmd_notice(self._session, nch, text)
 
     def ctcp_request(self, nick, request):
-        pass
+        lib.irc_cmd_ctcp_request(self._session, nick, request)
 
     def ctcp_reply(self, nick, reply):
-        pass
+        lib.irc_cmd_ctcp_reply(self._session, nick, reply)
 
     def nick(self, newnick):
-        pass
+        lib.irc_cmd_nick(self._session, newnick)
 
-    def quit(self, reason):
-        ffi.irc_cmd_quit(self._session, reason)
+    def quit(self, reason=ffi.NULL):
+        lib.irc_cmd_quit(self._session, reason)
 
-    def user_mode(self, mode):
-        pass
+    def user_mode(self, mode=ffi.NULL):
+        lib.irc_cmd_user_mode(self._session, mode)
 
-    def whois(self, nick):
-        pass
+    def whois(self, *nicks):
+        lib.irc_cmd_whois(self._session, ",".join(nicks))
 
     def raw(self, format, *args, **kwargs):
         format = format.format(*args, **kwargs)
-
+        lib.irc_send_raw(self._session, format)
