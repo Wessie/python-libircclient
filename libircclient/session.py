@@ -3,46 +3,67 @@ from functools import partial
 from .lib.irc import ffi, lib
 from .lib import convert_char_array, convert_strings
 import threading
+import collections
 
 
 __all__ = ["Session"]
 
 
-def event_callback(self, session, event, origin, params, count):
+def call_handlers(event, h1, h2, args=None, kwargs=None):
+    args = args or []
+    kwargs = kwargs or {}
+
+    for handler in h1.get_handlers_from_event(event):
+        handler(*args, **kwargs)
+    for handler in h2.get_handlers_from_event(event):
+        handler(*args, **kwargs)
+
+
+def event_callback(self, pyevent, session, event, origin, params, count):
     """
     Generic event handler, used for most events.
     """
     event, origin = convert_strings(event, origin)
     params = convert_char_array(params, count)
 
+    call_handlers(pyevent, handlers, self.handlers,
+                  (self, event, origin, params))
     print session, event, origin, params, count
+
 event_callback.signature = ("void(irc_session_t*, const char*,"
                             "const char*, const char**, unsigned int)")
 
 
-def event_dcc_chat(self, session, nick, address, dccid):
+def event_dcc_chat(self, pyevent, session, nick, address, dccid):
     """
     Event handler for DCC CHAT requests.
     """
     nick, address = convert_strings(nick, address)
 
+    call_handlers(pyevent, handlers, self.handlers,
+                  (self, nick, address, dccid))
     print session, nick, address, dccid
+
 event_dcc_chat.signature = ("void(irc_session_t*, const char*,"
                             "const char*, irc_dcc_t)")
 
 
-def event_dcc_send(self, session, nick, address, filename, size, dccid):
+def event_dcc_send(self, pyevent, session, nick,
+                   address, filename, size, dccid):
     """
     Event handler for DCC SEND requests.
     """
     nick, address, filename = convert_strings(nick, address, filename)
 
+    call_handlers(handlers, self.handlers,
+                  (self, nick, address, filename, size, dccid))
     print session, nick, address, filename, size, dccid
+
 event_dcc_send.signature = ("void(irc_session_t*, const char*, const char*,"
                             "const char*, unsigned long, irc_dcc_t)")
 
 
-def eventcode_callback(self, session, event, origin, params, count):
+def eventcode_callback(self, pyevent, session, event, origin, params, count):
     """
     Event handler for numeric events.
     """
@@ -50,7 +71,10 @@ def eventcode_callback(self, session, event, origin, params, count):
     origin, = convert_strings(origin)
     params = convert_char_array(params, count)
 
+    for handler in handlers.get_handlers_from_event(pyevent):
+        handler(self, event, origin, params)
     print session, event, origin, params, count
+
 eventcode_callback.signature = ("void(irc_session_t*, unsigned int,"
                                 "const char*, const char**, unsigned int)")
 
@@ -89,6 +113,44 @@ _callback_members = {
 }
 
 
+class Handlers(object):
+    events = set(
+        event[6:] for sublist in
+        _callback_members.itervalues() for event in sublist
+    )
+
+    def __init__(self):
+        super(Handlers, self).__init__()
+        self._callbacks = collections.defaultdict(list)
+
+    def register(self, event, name=None):
+        def wrapper(func):
+            if not (event in self.events):
+                # TODO: Check if we should raise an exception instead
+                return func
+
+            if name is not None:
+                self._callback_names[name] = func
+            self._callbacks[event].append(func)
+            return func
+        return wrapper
+
+    def unregister(self, name):
+        func = self._callback_names.get(name, None)
+        if func is None:
+            raise HandlerError("Handler does not exist with name: %r" % name)
+
+        for _, l in self._callbacks.iteritems():
+            l.remove(func)
+
+    def get_handlers_from_event(self, event):
+        event = event.lstrip("event_")
+        return self._callbacks.get(event, [])
+
+
+handlers = Handlers()
+
+
 class Session(object):
     """
     A session for an IRC client.
@@ -100,6 +162,8 @@ class Session(object):
 
         self._session = lib.irc_create_session(self._callbacks)
 
+        self.handlers = Handlers()
+
     def _create_callbacks(self):
         """
         Creates our C struct filled with our base-callbacks.
@@ -109,31 +173,26 @@ class Session(object):
         callbacks = ffi.new("irc_callbacks_t *")
         callback_store = []
 
-        for func, events in _callback_members.iteritems():
+        for origin_func, events in _callback_members.iteritems():
             # We want our callbacks to know which session they belong to,
             # while they do get their respective C session, they do not get
             # the python one, now they will!
 
             # Save the signature since partial will not copy them.
-            signature = func.signature
-            # Wrap the function so we pass it our current session
-            func = partial(func, self)
-            # And get our cdata function type!
-            func = ffi.callback(signature, func)
+            signature = origin_func.signature
 
             for event in events:
+                 # Wrap the function so we pass it our current session
+                func = partial(origin_func, self, event)
+                # And get our cdata function type!
+                func = ffi.callback(signature, func)
+                # set it on the struct
                 setattr(callbacks, event, func)
                 # Keep a reference around so it won't be deallocated
                 callback_store.append(func)
 
         self._callbacks = callbacks
         self._callback_store = callback_store
-
-    def add_handler(self, event, callback):
-        pass
-
-    def remove_handler(self, callback):
-        pass
 
     def connect(self, server, port, passwd, nick,
                 username=ffi.NULL, realname=ffi.NULL):
@@ -246,3 +305,11 @@ class Session(object):
     def raw(self, format, *args, **kwargs):
         format = format.format(*args, **kwargs)
         lib.irc_send_raw(self._session, format)
+
+    def get_nick(self, source):
+        buff = ffi.new("char[90]")
+        lib.irc_target_get_nick(source, buff, 90)
+
+        return ffi.string(buff, 90)
+
+

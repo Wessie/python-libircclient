@@ -19,4 +19,4 @@ def convert_strings(*chars):
 
     This returns a generator.
     """
-    return (ffi.string(string) for string in chars)
+    return (ffi.string(string) for string in chars if string != ffi.NULL)
